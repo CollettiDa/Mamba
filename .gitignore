@@ -1,0 +1,13 @@
+*.mat
+*.pt
+*.pth
+*.onnx
+*.zip
+*.docx
+*.csv
+*.toml
+*.h5
+
+*.pyc
+*.pyo
+*.pyd
