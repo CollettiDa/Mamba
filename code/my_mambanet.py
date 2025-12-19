@@ -294,7 +294,7 @@ class SS2D(nn.Module):
 
         x_bdl = tc.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
         dts, Bs, Cs = tc.split(x_bdl, [self.dt_rank, self.d_state, self.d_state], dim=2)  
-        dts = tc.einsum("b k r l, k r d -> b k d l", dts.view(B,K,-1,L), self.dt_projs_weight)
+        dts = tc.einsum("b k r l, k d r -> b k d l", dts.view(B,K,-1,L), self.dt_projs_weight)
 
         xs = xs.view(B, -1, L)
         dts = dts.contiguous().float().view(B, -1, L)
@@ -495,7 +495,7 @@ class MambaUNet(nn.Module):
             self.layers.append(layer)
         
         # Build decoder layers
-        self.layers_up = nn.MoluleList()
+        self.layers_up = nn.ModuleList()
         self.concat_back_dim = nn.ModuleList()
         for i_layer in range(self.num_layers):
             concat_linear = nn.Linear(
@@ -600,9 +600,12 @@ class MambaUNet(nn.Module):
 
 if __name__ == "__main__":
     B,N,H,W = 16,3,224,224
-    patch_size = 4
+    B,N,H,W = 16,2,21,21
+    patch_size = 3
+    stride = 3
     x = tc.randn(B,N,H,W).cuda()
-    model = PatchEmbed2D(img_size=H, patch_size=patch_size, in_chans=N, embed_dim=96).cuda()
+    # model = PatchEmbed2D(img_size=H, patch_size=patch_size, stride=stride, in_chans=N, embed_dim=96).cuda()
+    model = MambaUNet(img_size=H, patch_size=patch_size, in_chans=N, embed_dim=96, stride=stride).cuda()
     out = model(x)
     print(out.shape)
     print("done1")   
