@@ -329,7 +329,6 @@ tinycss2=1.5.1=pyhcf101f3_0
 tk=8.6.15=h54e0aa7_0
 tokenizers=0.21.0=py311h5e3497e_0
 tomli=2.3.0=pyhcf101f3_0
-torchsummary=1.5.1=pypi_0
 torchvision=0.24.0=cuda129_py311_h2942a37_0
 torchvision-extra-decoders=0.0.2=py311ha44aed6_3
 tornado=6.5.3=py311h49ec1c0_0

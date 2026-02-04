@@ -18,7 +18,7 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 import networks.mamba_sys as mamba_sys
 
 # from pytorch_model_summary import summary
-from torchsummary import summary
+
 
 class PatchEmbed2D(nn.Module):
     r""" Image to Patch Embedding
@@ -50,7 +50,7 @@ class PatchEmbed2D(nn.Module):
     
 class PatchMerging2D(nn.Module):
     r""" PatchMerging2D performs spatial downsampling by a factor of 2.
-        It groups each 2×2 neighborhood of tokens, concatenates their channels
+        It groups each 2x2 neighborhood of tokens, concatenates their channels
         (C → 4C), applies LayerNorm, and projects them to a lower-dimensional
         embedding (4C → 2C). The output has half the spatial resolution and
         twice the channel dimension: (B, H, W, C) → (B, H/2, W/2, 2C).
@@ -118,7 +118,7 @@ class PatchExpand(nn.Module):
         x = self.norm(x)
         return x
     
-class FinalPatchExpand_X4(nn.Module):
+class FinalPatchExpand(nn.Module):
     """
     FinalPatchExpand_X4 layer.
 
@@ -131,7 +131,7 @@ class FinalPatchExpand_X4(nn.Module):
         super().__init__()
         self.dim = dim
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(dim, 16*dim, bias = False)
+        self.expand = nn.Linear(dim, self.dim_scale**2 * dim, bias = False)
             # applied to last dimension
         self.output_dim = dim            
         self.norm = norm_layer(self.output_dim)
@@ -139,7 +139,7 @@ class FinalPatchExpand_X4(nn.Module):
     def forward(self, x):
         x = self.expand(x)
         B, H, W, C = x.shape
-        x = rearrange(x, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=4, p2=4, c=C//16)
+        x = rearrange(x, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=self.dim_scale, p2=self.dim_scale, c=C//self.dim_scale**2)
         x = self.norm(x)
         return x    
     
@@ -461,6 +461,7 @@ class MambaUNet(nn.Module):
                     **kwargs,
     ):
         super().__init__()
+        self.patch_size = patch_size
         self.num_classes = num_classes
         self.num_layers = len(depths)
         self.d_state = math.ceil(dims[0] / 6) if d_state is None else d_state
@@ -525,11 +526,13 @@ class MambaUNet(nn.Module):
         self.norm = norm_layer(self.num_features)
         self.norm_up = norm_layer(self.embed_dim)
 
+        self.zeropad2d = nn.ZeroPad2d((0,3,0,3))  # (left, right, top, bottom)
+
         if self.final_upsample == "expand_first":
             print("---final upsample expand_first---")
-            self.up = FinalPatchExpand_X4(dim_scale=4,dim=self.embed_dim)
+            self.up = FinalPatchExpand(dim_scale=self.patch_size,dim=self.embed_dim)
             self.output = nn.Conv2d(in_channels=self.embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
-
+        
         self.apply(self._init_weights)
         
     def _init_weights(self, m: nn.Module):
@@ -552,41 +555,50 @@ class MambaUNet(nn.Module):
     
     # Encoder and Bottleneck
     def forward_features(self, x: tc.Tensor):
+        print("Input shape to MambaUNet:", x.shape, flush=True)
         x = self.patch_embed(x)
-
+        print("After Patch Embedding:", x.shape, flush=True)
         x_downsample = []
         for layer in self.layers:
             x_downsample.append(x)
             x = layer(x)
+            print("After layer:", x.shape, flush=True)
         x = self.norm(x)
+        print("After norm:", x.shape, flush=True)
         return x, x_downsample
 
     # Decoder and Skip Connections
     def forward_up_features(self, x: tc.Tensor, x_downsample):
         for inx, layer_up in enumerate(self.layers_up):
+            print("Decoder layer index:", inx, "Input shape:", x.shape, flush=True)
             if inx == 0:
                 x = layer_up(x)
             else:
                 x = tc.cat([x, x_downsample[self.num_layers - inx - 1]], -1)
                 x = self.concat_back_dim[inx](x)
                 x = layer_up(x)
-        
+            print("After decoder layer:", x.shape, flush=True)
         x = self.norm_up(x)
+        print("After norm up:", x.shape, flush=True)
         return x
     
-    def up_x4(self, x):
+    def up_final(self, x):
+        print("Before final upsample:", x.shape, flush=True)
         if self.final_upsample=="expand_first":
             B,H,W,C = x.shape
             x = self.up(x)
-            x = x.view(B, 4*H, 4*W, -1)
+            x = x.view(B, self.patch_size*H, self.patch_size*W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             x = self.output(x)
+        print("After final upsample:", x.shape, flush=True)
         return x
 
     def forward(self, x: tc.Tensor):
+        x = self.zeropad2d(x)
         x, x_downsample = self.forward_features(x)
         x = self.forward_up_features(x, x_downsample)
-        x = self.up_x4(x)
+        x = self.up_final(x)
+        x = x[:, :, :x.shape[2]-3, :x.shape[3]-3]  # remove padding
         return x
     
     def flops(self, shape=(3, 224, 224)):
