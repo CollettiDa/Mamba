@@ -439,6 +439,105 @@ class VSSLayer(nn.Module):
             x = self.upsample(x)
         
         return x
+    
+class PatchEmbedVideo(nn.Module):
+    """ Video to Patch Embedding
+    Args:
+        img_size (int): Frame size.  Default: 21
+        in_chans (int): Number of input image channels. Default: 3
+        n_frames (int): Number of frames. Default: 8
+        patch_size (int): Patch token size. Default: 3
+        stride (int): Stride of the patch embedding. Default: None
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+    def __init__(self, image_size=21, n_frames=8, patch_size=3, 
+                 stride=None, in_chans=2, embed_dim=96, groups=1, 
+                 norm_layer=None, **kwargs):
+        super().__init__()
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+        if stride is None:
+            stride = patch_size
+        if isinstance(stride, int):
+            stride = (stride, stride)
+
+        self.proj = nn.Conv2d(in_chans, 
+                              embed_dim, 
+                              kernel_size=patch_size,
+                              stride=patch_size,
+                              groups=groups)
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None 
+        
+    def forward(self, x: tc.Tensor):
+        """ Forward function.
+        Args:
+            x: (tc.Tensor) Input video of shape (B, T, C, H, W)
+        Returns:
+            tc.Tensor: Patch embedded video of shape (B, H', W', embed_dim)
+        """
+        B, T, C, H, W = x.shape
+         
+        for t in range(T):
+            x_t = x[:, t, :, :, :]  # (B, C, H, W)
+            x_t = self.proj(x_t)  # (B, embed_dim, H', W')
+            if t == 0:
+                x_out = x_t.unsqueeze(1)  # (B, 1, embed_dim, H', W')
+            else:
+                x_out = tc.cat((x_out, x_t.unsqueeze(1)), dim=1)  # (B, T, embed_dim, H', W')
+        
+        
+        x_out = tc.reshape(x_out, (B, T, x_out.shape[2], x_out.shape[3]*x_out.shape[4]))
+        x_out = x_out.permute(0, 1, 3, 2)  # (B, T, H'*W', embed_dim)
+        if self.norm is not None:
+            x_out = self.norm(x_out)
+        
+        return x_out
+    
+class FinalPatchExpandVideo(nn.Module):
+    """
+    FinalPatchExpand layer.
+    # a kind of unembedding
+    Upsamples the input feature map by a factor of 4 by converting channel
+    information into spatial resolution. The operation applies a linear
+    projection followed by a PixelShuffle-style rearrangement:
+    (B, H, W, C) → (B, 4H, 4W, C).
+    """
+    def __init__(self, T, dim, dim_scale=3, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.dim_scale = dim_scale
+        self.expand = nn.Linear(dim, self.dim_scale**2 * dim, bias = False)
+            # applied to last dimension
+        self.output_dim = dim            
+        self.norm = norm_layer(self.output_dim)
+        self.condenseT = nn.Conv2d(in_channels=T, out_channels=1, kernel_size=1, bias=False)
+    
+    def s_flatten(x):
+        B, T, H, W, C = x.shape
+        x = x.view(B, T, H*W, C)
+        return x
+
+    def s_unflatten(x, H, W):
+        B, T, HW, C = x.shape
+        x = x.view(B, T, H, W, C)
+        return x
+    
+    def forward(self, x):
+        x = self.condenseT(x)
+        print(f"x.shape after condenseT: {x.shape}")
+        B, T, HW, C = x.shape
+        H = np.sqrt(HW).astype(int)
+        W = H
+        x = x.view(B, T, H, W, C).squeeze(1)  # (B, H, W, C)
+        x = self.expand(x)
+        B, H, W, C = x.shape
+        x = rearrange(x, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=self.dim_scale, p2=self.dim_scale, c=C//self.dim_scale**2)
+        x = self.norm(x)
+        return x    
 
 class MambaUNet(nn.Module):
     r""" Mamba U-Net
@@ -448,7 +547,7 @@ class MambaUNet(nn.Module):
                     patch_size=4,
                     in_chans=3,
                     num_classes=4,
-                    depths=[2,2,6,2],
+                    depths=[2,2,2,2],
                     dims=[96, 192, 384, 768],
                     d_state=16,
                     drop_rate=0,
@@ -472,10 +571,17 @@ class MambaUNet(nn.Module):
         self.dims = dims
         self.final_upsample = final_upsample
 
-        self.patch_embed = PatchEmbed2D(patch_size=patch_size,
-                                        in_chans=in_chans,
-                                        embed_dim=self.embed_dim,
-                                        norm_layer=norm_layer if patch_norm else None)
+        # self.patch_embed = PatchEmbed2D(patch_size=patch_size,
+        #                                 in_chans=in_chans,
+        #                                 embed_dim=self.embed_dim,
+        #                                 norm_layer=norm_layer if patch_norm else None)
+
+        self.patch_embed = PatchEmbedVideo(image_size=patch_size*8,
+                                           n_frames=8,
+                                           patch_size=patch_size,
+                                           in_chans=in_chans,
+                                           embed_dim=self.embed_dim,
+                                           norm_layer=norm_layer if patch_norm else None)
 
         dpr = [x.item() for x in tc.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
     
@@ -528,11 +634,19 @@ class MambaUNet(nn.Module):
 
         self.zeropad2d = nn.ZeroPad2d((0,3,0,3))  # (left, right, top, bottom)
 
-        if self.final_upsample == "expand_first":
-            print("---final upsample expand_first---")
-            self.up = FinalPatchExpand(dim_scale=self.patch_size,dim=self.embed_dim)
-            self.output = nn.Conv2d(in_channels=self.embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
-        
+        # if self.final_upsample == "expand_first":
+        #     print("---final upsample expand_first---")
+        #     self.up = FinalPatchExpand(dim_scale=self.patch_size,dim=self.embed_dim)
+        #     self.output = nn.Conv2d(in_channels=self.embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
+        self.up = FinalPatchExpandVideo(T=16, dim=self.embed_dim,
+                                        dim_scale=self.patch_size,
+                                        norm_layer=norm_layer)
+        self.output = nn.Conv2d(in_channels=self.embed_dim,
+                                out_channels=self.num_classes,
+                                kernel_size=1,
+                                bias=False)
+
+    
         self.apply(self._init_weights)
         
     def _init_weights(self, m: nn.Module):
@@ -583,22 +697,24 @@ class MambaUNet(nn.Module):
         return x
     
     def up_final(self, x):
-        print("Before final upsample:", x.shape, flush=True)
-        if self.final_upsample=="expand_first":
-            B,H,W,C = x.shape
-            x = self.up(x)
-            x = x.view(B, self.patch_size*H, self.patch_size*W, -1)
-            x = x.permute(0, 3, 1, 2)  # B,C,H,W
-            x = self.output(x)
-        print("After final upsample:", x.shape, flush=True)
+        x = self.up(x)
+        x = self.output(x.permute(0, 3, 1, 2))  # B,C,H,W
+        # print("Before final upsample:", x.shape, flush=True)
+        # if self.final_upsample=="expand_first":
+        #     B,H,W,C = x.shape
+        #     x = self.up(x)
+        #     x = x.view(B, self.patch_size*H, self.patch_size*W, -1)
+        #     x = x.permute(0, 3, 1, 2)  # B,C,H,W
+        #     x = self.output(x)
+        # print("After final upsample:", x.shape, flush=True)
         return x
 
     def forward(self, x: tc.Tensor):
-        x = self.zeropad2d(x)
+        # x = self.zeropad2d(x)
         x, x_downsample = self.forward_features(x)
         x = self.forward_up_features(x, x_downsample)
         x = self.up_final(x)
-        x = x[:, :, :x.shape[2]-3, :x.shape[3]-3]  # remove padding
+        # x = x[:, :, :x.shape[2]-3, :x.shape[3]-3]  # remove padding
         return x
     
     def flops(self, shape=(3, 224, 224)):
@@ -611,13 +727,13 @@ class MambaUNet(nn.Module):
 
 
 if __name__ == "__main__":
-    B,N,H,W = 16,3,224,224
-    B,N,H,W = 16,2,21,21
+    # B,N,H,W = 16,3,224,224
+    B,T,N,H,W = 16,16,2,24,24
     patch_size = 3
     stride = 3
-    x = tc.randn(B,N,H,W).cuda()
+    x = tc.randn(B,T,N,H,W).cuda()
     # model = PatchEmbed2D(img_size=H, patch_size=patch_size, stride=stride, in_chans=N, embed_dim=96).cuda()
-    model = MambaUNet(img_size=H, patch_size=patch_size, in_chans=N, embed_dim=96, stride=stride).cuda()
+    model = MambaUNet(img_size=H, patch_size=patch_size, in_chans=N, embed_dim=96,num_classes=2, stride=stride).cuda()
     out = model(x)
     print(out.shape)
     print("done1")   
